@@ -1,14 +1,33 @@
 // ==UserScript==
 // @name         Pinterest - Copy Board, Pinner, Pin Actions (Fetch interceptor)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  Перехват fetch-запросов для получения данных пинов
+// @version      3.1
+// @description  Перехват fetch-запросов для получения данных пинов с логированием и пересозданием кнопок
 // @match        *://*.pinterest.com/pin/*
 // @run-at       document-start
 // @grant        GM_setClipboard
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
+
 (function() {
     'use strict';
+
+    // Конфигурация логирования
+    const config = {
+        enableLogging: GM_getValue('enableLogging', false)
+    };
+
+    // Функция логирования
+    const log = (...args) => config.enableLogging && console.log('[PinCopy]', ...args);
+
+    // Меню для вкл/выкл логирования
+    GM_registerMenuCommand('Логирование: ' + (config.enableLogging ? 'Вкл' : 'Выкл'), () => {
+        config.enableLogging = !config.enableLogging;
+        GM_setValue('enableLogging', config.enableLogging);
+        showMessage('Логирование: ' + (config.enableLogging ? 'Вкл' : 'Выкл'));
+    });
 
     // Кеш данных пинов
     const pinCache = new Map();
@@ -31,21 +50,23 @@
                     const contentType = this.getResponseHeader('content-type');
                     if (contentType && contentType.includes('application/json')) {
                         const data = JSON.parse(this.responseText);
+                        log('XHR response:', url, data);
 
                         const pinData = extractPinFromResponse(data);
                         if (pinData && pinData.id) {
+                            log('Pin extracted:', pinData.id);
                             pinCache.set(String(pinData.id), pinData);
 
                             const currentPinId = getPinIdFromUrl();
 
                             if (String(pinData.id) === String(currentPinId)) {
-                                setTimeout(() => updateUIFromCache(currentPinId), 100);
+                                updateUIFromCache(currentPinId);
                             }
                         }
                     }
                 }
             } catch(e) {
-                // Игнорируем ошибки
+                log('Error in XHR handling:', e);
             }
         });
         return originalXHRSend.apply(this, args);
@@ -65,26 +86,29 @@
                 const contentType = response.headers.get('content-type');
                 if (contentType && contentType.includes('application/json')) {
                     const data = await clonedResponse.json();
+                    log('Fetch response:', url, data);
 
                     const pinData = extractPinFromResponse(data);
                     if (pinData && pinData.id) {
+                        log('Pin extracted:', pinData.id);
                         pinCache.set(String(pinData.id), pinData);
 
                         const currentPinId = getPinIdFromUrl();
                         if (String(pinData.id) === String(currentPinId)) {
-                            setTimeout(() => updateUIFromCache(currentPinId), 100);
+                            updateUIFromCache(currentPinId);
                         }
                     }
                 }
             }
         } catch(e) {
-            // Игнорируем ошибки
+            log('Error in fetch handling:', e);
         }
 
         return response;
     };
 
     function extractPinFromResponse(data) {
+        log('Extracting pin from response:', data);
         function findPin(obj, depth = 0) {
             if (!obj || typeof obj !== 'object' || depth > 10) return null;
 
@@ -148,6 +172,7 @@
     function getPinDataFromCache(pinId) {
         const cached = pinCache.get(String(pinId));
         if (cached) {
+            log('Pin data from cache:', pinId, cached);
             return {
                 pinId: cached.id,
                 boardName: cached.board?.name || '',
@@ -192,15 +217,16 @@
                     }
                 }
             }
+            log('Pin data from script:', pinData);
         } catch (e) {
-            console.error('Pin data extraction failed', e);
+            log('Pin data extraction failed:', e);
         }
         return pinData;
     }
 
     function copyToClipboard(text) {
         if (typeof GM_setClipboard !== 'undefined') GM_setClipboard(text);
-        else navigator.clipboard.writeText(text).catch(console.error);
+        else navigator.clipboard.writeText(text).catch(e => log('Clipboard error:', e));
     }
 
     function showMessage(msg) {
@@ -286,21 +312,30 @@
 
     function actionB() {
         if (pinInfo?.boardUrl) {
+            log('Copying board:', pinInfo.boardUrl);
             copyToClipboard(`Board: ${pinInfo.boardName} | ${pinInfo.boardUrl}`);
             window.open(pinInfo.boardUrl, '_blank');
             showMessage('Доска скопирована и открыта');
-        } else showMessage('Доска не найдена');
+        } else {
+            log('Board not found for pin:', pinInfo?.pinId);
+            showMessage('Доска не найдена');
+        }
     }
 
     function actionA() {
         if (pinInfo?.pinnerUrl) {
+            log('Copying author:', pinInfo.pinnerUrl);
             copyToClipboard(`Pinner: ${pinInfo.pinnerName} | ${pinInfo.pinnerUrl}`);
             window.open(pinInfo.pinnerUrl, '_blank');
             showMessage('Автор скопирован и открыт');
-        } else showMessage('Автор не найден');
+        } else {
+            log('Author not found for pin:', pinInfo?.pinId);
+            showMessage('Автор не найден');
+        }
     }
 
     function updateUIFromCache(pinId) {
+        log('Updating UI for pin:', pinId);
         pinInfo = getPinDataFromCache(pinId);
 
         if (!pinInfo) return;
@@ -313,18 +348,28 @@
         }
     }
 
+    // ---------- Удаление старых кнопок ----------
+    function removeOldButtons() {
+        ['btnBoard', 'btnAuthor', '__pin_buttons_toast__'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.remove();
+        });
+    }
+
     // ---------- SPA watcher ----------
     let lastPinId = getPinIdFromUrl();
 
     function handleNavigation() {
         const newPinId = getPinIdFromUrl();
         if (newPinId && newPinId !== lastPinId) {
+            log('Navigation to new pin:', newPinId);
             lastPinId = newPinId;
 
-            if (btnB && btnA) {
-                setButtonColor(btnB, 'yellow');
-                setButtonColor(btnA, 'yellow');
-            }
+            // Удаляем старые кнопки и пересоздаём
+            removeOldButtons();
+            btnB = null;
+            btnA = null;
+            initUI();
 
             // Проверяем кеш
             const cached = getPinDataFromCache(newPinId);
